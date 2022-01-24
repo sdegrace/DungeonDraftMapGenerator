@@ -1,4 +1,3 @@
-import io
 import json
 import re
 import random
@@ -20,16 +19,12 @@ from shapely.geometry import *
 from shapely.geometry.polygon import Polygon
 from shapely import ops
 
-from lloyd import Field
-
-import tkinter as tk
-
 rng = default_rng()
 
-num_major_points = 20
-num_minor_points = 40
+num_major_points = 40
+# num_minor_points = 40
 relaxation_amount = 5
-exterior_buffer = 0.1
+exterior_buffer = 5
 min_building_street_face = 64
 mean_building_street_face = 10
 max_building_street_face = 512
@@ -38,6 +33,9 @@ mean_building_depth = 7
 max_building_depth = 512
 min_street_offset = 64
 max_street_offset = 128
+
+min_building_ratio = .33
+max_building_ratio = 3
 
 
 def gen_node(current):
@@ -104,38 +102,67 @@ def get_ridges(vor):
 
     return finite_segments, infinite_segments
 
+def generate_random(number, polygon):
+    points = []
+    minx, miny, maxx, maxy = polygon.bounds
+    while len(points) < number:
+        pnt = Point(random.uniform(minx, maxx), random.uniform(miny, maxy))
+        if polygon.contains(pnt):
+            points.append(pnt)
+    return MultiPoint(points)
 
-def construct_streets(poly, n_points):
-    min_x, min_y, max_x, max_y = poly.bounds
+def partition_voronoi(poly, n_points, buffer_amount=0):
+    xmin, ymin, xmax, ymax = poly.bounds
+    buffer_amount = max(xmax-xmin, ymax-ymin) * buffer_amount
+    buffered_region = poly.buffer(buffer_amount)
+    random_points = generate_random(n_points, buffered_region)
+    return MultiPolygon([r.intersection(buffered_region) for r in ops.voronoi_diagram(random_points)])
 
-    x_range = max_x - min_x
-    y_range = max_y - min_y
 
-    x_buffer = x_range * exterior_buffer
-    y_buffer = y_range * exterior_buffer
+def relax(voronoi, poly, buffer_amount=0):
+    xmin, ymin, xmax, ymax = poly.bounds
+    buffer_amount = max(xmax - xmin, ymax - ymin) * buffer_amount
+    buffered_region = poly.buffer(buffer_amount)
+    points = MultiPoint([poly.centroid for poly in voronoi])
+    return MultiPolygon([r.intersection(buffered_region) for r in ops.voronoi_diagram(points)])
 
-    xs = rng.integers(min_x - x_buffer, max_x + x_buffer, n_points)
-    ys = rng.integers(min_y - y_buffer, max_y + y_buffer, n_points)
-    points = np.vstack([xs, ys]).T
-    field = Field(points)
+def partition_district(poly, n_points, relaxation_num):
+    neighborhoods = partition_voronoi(poly, n_points)
+    for i in range(relaxation_num):
+        neighborhoods = relax(neighborhoods, poly)
+    return MultiPolygon([r.intersection(poly) for r in neighborhoods])
 
-    for i in range(relaxation_amount):
-        field.relax()
-
-    mask = []
-    for p in field.get_points():
-        mask.append(poly.contains(Point(p[0], p[1])))
-
-    culled_field = Field(field.get_points()[mask])
-
-    finite_segments, infinite_segments = get_ridges(culled_field.voronoi)
-
-    streets = MultiLineString(infinite_segments + finite_segments)
-    substreets = []
-    for line in poly.intersection(streets).geoms:
-        substreets.append(list(line.coords))
-    split_poly = ops.split(poly_to_multi_line_string(poly), streets)
-    return MultiPolygon(ops.polygonize(poly.intersection(streets).union(split_poly))), poly.intersection(streets)
+# def construct_streets(poly, n_points):
+#     min_x, min_y, max_x, max_y = poly.bounds
+#
+#     x_range = max_x - min_x
+#     y_range = max_y - min_y
+#
+#     x_buffer = x_range * exterior_buffer
+#     y_buffer = y_range * exterior_buffer
+#
+#     xs = rng.integers(min_x - x_buffer, max_x + x_buffer, n_points)
+#     ys = rng.integers(min_y - y_buffer, max_y + y_buffer, n_points)
+#     points = np.vstack([xs, ys]).T
+#     field = Field(points)
+#
+#     for i in range(relaxation_amount):
+#         field.relax()
+#
+#     mask = []
+#     for p in field.get_points():
+#         mask.append(poly.contains(Point(p[0], p[1])))
+#
+#     culled_field = Field(field.get_points()[mask])
+#
+#     finite_segments, infinite_segments = get_ridges(culled_field.voronoi)
+#
+#     streets = MultiLineString(infinite_segments + finite_segments)
+#     substreets = []
+#     for line in poly.intersection(streets).geoms:
+#         substreets.append(list(line.coords))
+#     split_poly = ops.split(poly_to_multi_line_string(poly), streets)
+#     return MultiPolygon(ops.polygonize(poly.intersection(streets).union(split_poly))), poly.intersection(streets)
 
 
 def scatter_buildings(neighborhood):
@@ -151,9 +178,14 @@ def scatter_buildings(neighborhood):
             if first and last_remainder is not None:
                 depth = last_remainder.length
             else:
-                depth = random.uniform(min_building_depth, max_building_depth)
+                depth = random.uniform(max(min_building_depth, front_len*min_building_ratio),
+                                       min(max_building_depth, front_len*max_building_ratio))
 
             front, rem_len_temp = cut(rem_len, front_len)
+            if not min_building_ratio < front_len / depth < max_building_ratio:
+                rem_len = rem_len_temp
+                last_remainder = rem_len
+                continue
             front_offset = random.uniform(min_street_offset, max_street_offset)
             building = front.parallel_offset(front_offset, 'right').union(
                 front.parallel_offset(depth, 'right')).minimum_rotated_rectangle
@@ -247,7 +279,10 @@ all_lines = list(itertools.pairwise(list(itertools.pairwise(t + t[:2]))[::2]))
 
 p = Polygon([l[0] for l in all_lines])
 
-polys, streets = construct_streets(p, num_major_points)
+polys = partition_district(p, num_major_points, relaxation_amount)
+
+streets = [[s for s in poly_to_multi_line_string(r) if not s.within(p.boundary.buffer(100))] for r in polys]
+streets = MultiLineString(list(itertools.chain.from_iterable(streets)))
 
 fig, ax = plt.subplots()
 
